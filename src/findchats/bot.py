@@ -4,18 +4,19 @@ import asyncio
 import html
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from itertools import count
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
+from .config import settings
 from .discovery import TelegramChatDiscovery
 from .models import SearchHit
 
 LOGGER = logging.getLogger(__name__)
 SEARCH_SEQUENCE = count(1)
-PAGE_SIZE = 100
 
 
 @dataclass(slots=True)
@@ -25,6 +26,8 @@ class PaginatedSearchState:
     mode: str
     hits: list[SearchHit]
     next_page: int = 2
+    created_at: datetime | None = None
+    last_accessed_at: datetime | None = None
 
 
 def build_dispatcher(discovery: TelegramChatDiscovery) -> Dispatcher:
@@ -32,6 +35,7 @@ def build_dispatcher(discovery: TelegramChatDiscovery) -> Dispatcher:
     search_semaphore = asyncio.Semaphore(1)
     background_tasks: set[asyncio.Task[None]] = set()
     pagination_state_by_user: dict[int, PaginatedSearchState] = {}
+    page_state_ttl = timedelta(minutes=settings.page_state_ttl_minutes)
 
     @dispatcher.message(Command("start"))
     async def start(message: Message) -> None:
@@ -59,7 +63,7 @@ def build_dispatcher(discovery: TelegramChatDiscovery) -> Dispatcher:
             "3. Відкидає broadcast channels.\n"
             "4. Сортує результати за кількістю учасників.\n"
             "5. Пошук іде у фоні, результат прийде окремим повідомленням.\n\n"
-            "6. Перша сторінка містить до 100 результатів, далі використовуй `/nextpage`.\n\n"
+            f"6. Перша сторінка містить до {settings.page_size} результатів, далі використовуй `/nextpage`.\n\n"
             "Приклади:\n"
             "`/groups Львів`\n"
             "`/channels Львів`\n"
@@ -75,6 +79,7 @@ def build_dispatcher(discovery: TelegramChatDiscovery) -> Dispatcher:
             await message.answer("Не вдалося визначити користувача для пагінації.")
             return
 
+        _cleanup_expired_pagination_states(pagination_state_by_user, page_state_ttl)
         state = pagination_state_by_user.get(user.id)
         if state is None:
             LOGGER.info("command_nextpage_empty user_id=%s chat_id=%s", user.id, message.chat.id)
@@ -111,6 +116,7 @@ def build_dispatcher(discovery: TelegramChatDiscovery) -> Dispatcher:
         for chunk in chunks:
             await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
         state.next_page += 1
+        state.last_accessed_at = _now_utc()
 
     @dispatcher.message(Command("groups"))
     async def groups(message: Message, command: CommandObject) -> None:
@@ -128,12 +134,16 @@ def build_dispatcher(discovery: TelegramChatDiscovery) -> Dispatcher:
             return
         await _run_search(message, discovery, city, "channels", search_semaphore, background_tasks, pagination_state_by_user)
 
-    @dispatcher.message(F.text)
+    @dispatcher.message(F.text & ~F.text.startswith("/"))
     async def search_from_text(message: Message) -> None:
         city = (message.text or "").strip()
-        if city.startswith("/"):
-            return
         await _run_search(message, discovery, city, "groups", search_semaphore, background_tasks, pagination_state_by_user)
+
+    @dispatcher.message(F.text.startswith("/"))
+    async def unknown_command(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else None
+        LOGGER.info("command_unknown user_id=%s chat_id=%s text=%r", user_id, message.chat.id, message.text)
+        await message.answer(_help_text("Невідома команда."), parse_mode="Markdown")
 
     return dispatcher
 
@@ -150,9 +160,11 @@ def _schedule_search(
     semaphore: asyncio.Semaphore,
     background_tasks: set[asyncio.Task[None]],
     pagination_state_by_user: dict[int, PaginatedSearchState],
+    page_state_ttl: timedelta,
 ) -> None:
     search_id = next(SEARCH_SEQUENCE)
     user_id = message.from_user.id if message.from_user else None
+    _cleanup_expired_pagination_states(pagination_state_by_user, page_state_ttl)
     LOGGER.info("search_scheduled user_id=%s chat_id=%s search_id=%s city=%r mode=%s", user_id, message.chat.id, search_id, city, mode)
 
     async def runner() -> None:
@@ -190,11 +202,14 @@ def _schedule_search(
             return
 
         if message.from_user is not None:
+            timestamp = _now_utc()
             pagination_state_by_user[message.from_user.id] = PaginatedSearchState(
                 city=city,
                 search_id=search_id,
                 mode=mode,
                 hits=hits,
+                created_at=timestamp,
+                last_accessed_at=timestamp,
             )
 
         first_page_hits = _page_slice(hits, 1)
@@ -226,11 +241,20 @@ async def _run_search(
     background_tasks: set[asyncio.Task[None]],
     pagination_state_by_user: dict[int, PaginatedSearchState],
 ) -> None:
-    _schedule_search(message, discovery, city, mode, semaphore, background_tasks, pagination_state_by_user)
+    _schedule_search(
+        message,
+        discovery,
+        city,
+        mode,
+        semaphore,
+        background_tasks,
+        pagination_state_by_user,
+        page_state_ttl=timedelta(minutes=settings.page_state_ttl_minutes),
+    )
 
 
 def _render_hits(city: str, hits: list[SearchHit], search_id: int, page: int, total_hits: int, mode: str) -> list[str]:
-    total_pages = max(1, (total_hits + PAGE_SIZE - 1) // PAGE_SIZE)
+    total_pages = max(1, (total_hits + settings.page_size - 1) // settings.page_size)
     title = "Групи" if mode == "groups" else "Канали з linked groups"
     lines = [
         f"<b>{title} для пошуку #{search_id}:</b> {html.escape(city)}",
@@ -238,7 +262,7 @@ def _render_hits(city: str, hits: list[SearchHit], search_id: int, page: int, to
         f"<b>Total chats:</b> {total_hits}",
         "",
     ]
-    base_index = (page - 1) * PAGE_SIZE
+    base_index = (page - 1) * settings.page_size
     for index, hit in enumerate(hits, start=1):
         lines.extend(_render_single_hit(base_index + index, hit, mode))
 
@@ -263,9 +287,48 @@ def _render_hits(city: str, hits: list[SearchHit], search_id: int, page: int, to
 
 
 def _page_slice(hits: list[SearchHit], page: int) -> list[SearchHit]:
-    start = (page - 1) * PAGE_SIZE
-    end = start + PAGE_SIZE
+    start = (page - 1) * settings.page_size
+    end = start + settings.page_size
     return hits[start:end]
+
+
+def _help_text(prefix: str | None = None) -> str:
+    lines = []
+    if prefix:
+        lines.append(prefix)
+        lines.append("")
+    lines.extend(
+        [
+            "Доступні команди:",
+            "`/groups Київ` - знайти групи",
+            "`/channels Київ` - знайти канали з linked groups",
+            "`/nextpage` - наступна сторінка останнього пошуку",
+            "`/help` - коротка довідка",
+            "",
+            "Також можна просто надіслати назву міста окремим повідомленням.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _cleanup_expired_pagination_states(
+    pagination_state_by_user: dict[int, PaginatedSearchState],
+    ttl: timedelta,
+) -> None:
+    now = _now_utc()
+    expired_user_ids = [
+        user_id
+        for user_id, state in pagination_state_by_user.items()
+        if (state.last_accessed_at or state.created_at or now) + ttl < now
+    ]
+    for user_id in expired_user_ids:
+        pagination_state_by_user.pop(user_id, None)
+    if expired_user_ids:
+        LOGGER.info("pagination_state_cleanup removed_users=%s ttl_minutes=%s", len(expired_user_ids), int(ttl.total_seconds() // 60))
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _render_single_hit(position: int, hit: SearchHit, mode: str) -> list[str]:

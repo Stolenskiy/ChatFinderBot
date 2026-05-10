@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from unidecode import unidecode
 
 
@@ -8,18 +10,30 @@ KEYWORDS = [
     "group",
     "community",
     "forum",
-    "чат",
     "группа",
     "група",
+    "city",
+    "events",
     "новости",
-    "новини",
+    "jobs",
+    "job",
+    "work",
     "работа",
     "робота",
     "объявления",
-    "оголошення",
     "барахолка",
     "market",
+    "people",
+    "life",
+    "help",
 ]
+
+@dataclass(frozen=True, slots=True)
+class SearchQueryVariant:
+    query: str
+    base_variant: str
+    keyword: str | None
+    kind: str
 
 
 def _unique_keep_order(items: list[str]) -> list[str]:
@@ -37,26 +51,50 @@ def _unique_keep_order(items: list[str]) -> list[str]:
     return result
 
 
-def generate_city_variants(city: str) -> list[str]:
+def _base_city_variants(city: str) -> list[str]:
     base = city.strip()
     transliterated = unidecode(base).strip()
-    variants = [
-        base,
-        base.lower(),
-        base.title(),
-        transliterated,
-        transliterated.lower(),
-        transliterated.title(),
-    ]
+    return _unique_keep_order(
+        [
+            base,
+            base.lower(),
+            base.title(),
+            transliterated,
+            transliterated.lower(),
+            transliterated.title(),
+        ]
+    )
 
-    query_variants = list(variants)
+
+def generate_city_variants(city: str) -> list[str]:
+    return [variant.query for variant in generate_search_queries(city)]
+
+
+def generate_search_queries(city: str) -> list[SearchQueryVariant]:
+    variants = _base_city_variants(city)
+    items: list[SearchQueryVariant] = []
+    seen_queries: set[str] = set()
+
+    def add(query: str, base_variant: str, keyword: str | None, kind: str) -> None:
+        normalized = query.strip()
+        if not normalized:
+            return
+        key = normalized.casefold()
+        if key in seen_queries:
+            return
+        seen_queries.add(key)
+        items.append(SearchQueryVariant(query=normalized, base_variant=base_variant, keyword=keyword, kind=kind))
+
+    for variant in variants:
+        add(variant, variant, None, "base")
+
     for variant in variants:
         for keyword in KEYWORDS:
-            query_variants.append(f"{variant} {keyword}")
+            add(f"{variant} {keyword}", variant, keyword, "keyword")
 
-    return _unique_keep_order(query_variants)
+    return items
 
 
 def normalized_needles(city: str) -> list[str]:
-    variants = generate_city_variants(city)
+    variants = _base_city_variants(city)
     return _unique_keep_order([variant.casefold() for variant in variants])

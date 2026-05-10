@@ -9,17 +9,18 @@ from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.types import Channel, Chat
 
-from .city_variants import generate_city_variants, normalized_needles
+from .analytics import KeywordAnalyticsCollector
+from .city_variants import SearchQueryVariant, generate_search_queries, normalized_needles
 from .models import SearchHit
 
 LOGGER = logging.getLogger(__name__)
 
 
 class TelegramChatDiscovery:
-    def __init__(self, client: TelegramClient, search_limit_per_query: int, result_limit: int) -> None:
+    def __init__(self, client: TelegramClient, search_limit_per_query: int, analytics: KeywordAnalyticsCollector) -> None:
         self._client = client
         self._search_limit_per_query = search_limit_per_query
-        self._result_limit = result_limit
+        self._analytics = analytics
 
     async def search_city(self, city: str) -> list[SearchHit]:
         return await self._search(city, include_groups=True, include_channels=False)
@@ -28,7 +29,7 @@ class TelegramChatDiscovery:
         return await self._search(city, include_groups=False, include_channels=True)
 
     async def _search(self, city: str, include_groups: bool, include_channels: bool) -> list[SearchHit]:
-        queries = generate_city_variants(city)
+        queries = generate_search_queries(city)
         needles = normalized_needles(city)
         hits_by_chat_id: dict[int, SearchHit] = {}
         LOGGER.info(
@@ -39,25 +40,52 @@ class TelegramChatDiscovery:
             include_channels,
         )
 
-        for query in queries:
+        for index, query_variant in enumerate(queries, start=1):
             try:
-                found = await self._client(SearchRequest(q=query, limit=self._search_limit_per_query))
+                found = await self._client(SearchRequest(q=query_variant.query, limit=self._search_limit_per_query))
             except RPCError as error:
-                LOGGER.warning("SearchRequest failed for query '%s': %s", query, error)
+                LOGGER.warning("SearchRequest failed for query '%s': %s", query_variant.query, error)
                 continue
 
-            LOGGER.info("search_query_completed city=%r query=%r chat_count=%s", city, query, len(found.chats))
+            LOGGER.info("search_query_completed city=%r query=%r chat_count=%s", city, query_variant.query, len(found.chats))
+
+            query_accepted_hit_count = 0
+            query_duplicate_hit_count = 0
+            query_new_unique_hit_count = 0
 
             for entity in found.chats:
                 hit = await self._build_hit(entity, needles, include_groups=include_groups, include_channels=include_channels)
                 if hit is None:
                     continue
 
+                query_accepted_hit_count += 1
+
                 existing = hits_by_chat_id.get(hit.chat_id)
                 if existing is None or hit.relevance_score > existing.relevance_score:
+                    if existing is None:
+                        query_new_unique_hit_count += 1
+                    else:
+                        query_duplicate_hit_count += 1
                     hits_by_chat_id[hit.chat_id] = hit
                 elif existing is not None:
+                    query_duplicate_hit_count += 1
                     existing.matched_by = sorted(set(existing.matched_by + hit.matched_by))
+
+            self._analytics.record_query_event(
+                {
+                    "city": city,
+                    "mode": "groups" if include_groups else "channels",
+                    "query": query_variant.query,
+                    "query_index": index,
+                    "base_variant": query_variant.base_variant,
+                    "keyword": query_variant.keyword,
+                    "query_kind": query_variant.kind,
+                    "raw_chat_count": len(found.chats),
+                    "accepted_hit_count": query_accepted_hit_count,
+                    "new_unique_hit_count": query_new_unique_hit_count,
+                    "duplicate_hit_count": query_duplicate_hit_count,
+                }
+            )
 
         ranked_hits = sorted(
             hits_by_chat_id.values(),
@@ -65,14 +93,13 @@ class TelegramChatDiscovery:
             reverse=True,
         )
         LOGGER.info(
-            "search_city_completed city=%r unique_hits=%s returned_hits=%s include_groups=%s include_channels=%s",
+            "search_city_completed city=%r returned_hits=%s include_groups=%s include_channels=%s",
             city,
             len(ranked_hits),
-            min(len(ranked_hits), self._result_limit),
             include_groups,
             include_channels,
         )
-        return ranked_hits[: self._result_limit]
+        return ranked_hits
 
     async def _build_hit(
         self,

@@ -6,6 +6,7 @@ import logging
 from aiogram import Bot
 from telethon import TelegramClient
 
+from .analytics import KeywordAnalyticsCollector
 from .bot import build_dispatcher, run_bot
 from .config import settings
 from .discovery import TelegramChatDiscovery
@@ -18,6 +19,7 @@ LOGGER = logging.getLogger(__name__)
 async def app() -> None:
     log_file = setup_logging(settings.bot_log_level, settings.bot_log_dir)
     LOGGER.info("bot_startup_initiated log_file=%s", log_file)
+    analytics = KeywordAnalyticsCollector(settings.analytics_dir)
 
     bot = Bot(token=settings.bot_token)
     mtproto_client = TelegramClient(
@@ -37,14 +39,14 @@ async def app() -> None:
     discovery = TelegramChatDiscovery(
         client=mtproto_client,
         search_limit_per_query=settings.search_limit_per_query,
-        result_limit=settings.result_limit,
+        analytics=analytics,
     )
     dispatcher = build_dispatcher(discovery)
     LOGGER.info(
-        "bot_initialized session_name=%s search_limit_per_query=%s result_limit=%s",
+        "bot_initialized session_name=%s search_limit_per_query=%s page_size=%s",
         settings.telegram_session_name,
         settings.search_limit_per_query,
-        settings.result_limit,
+        settings.page_size,
     )
 
     try:
